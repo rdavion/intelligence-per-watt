@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import types
 from typing import TYPE_CHECKING, Any, Optional
 
 from ipw.agents.base import BaseAgent
@@ -62,11 +63,65 @@ class Terminus(BaseAgent):
             )
 
         self.agent = Terminus2(model_name=model, **kwargs)
+        self._records_lm_calls = self._instrument_lm_calls(model)
         self._docker_image = docker_image
         self._container_name = container_name or "terminus-container"
         self._docker_client = None
         self._container = None
         self._owns_container = False
+
+    def _instrument_lm_calls(self, model_name: str) -> bool:
+        """Wrap Terminus2's internal LLM call method for per-call events."""
+        llm = getattr(self.agent, "_llm", None)
+        if llm is None or getattr(llm, "_ipw_terminus_instrumented", False) is True:
+            return False
+        original_call = getattr(llm, "call", None)
+        if not callable(original_call):
+            return False
+
+        def _estimate_tokens(_llm: Any, value: Any) -> int:
+            try:
+                return int(_llm.count_tokens(value))
+            except Exception:
+                return max(1, len(str(value)) // 4) if value is not None else 0
+
+        def _instrumented_call(_llm: Any, *args: Any, **kwargs: Any) -> Any:
+            prompt = kwargs.get("prompt")
+            if prompt is None and args:
+                prompt = args[0]
+            message_history = kwargs.get("message_history") or []
+            prompt_tokens = _estimate_tokens(_llm, message_history) + _estimate_tokens(
+                _llm,
+                prompt,
+            )
+            self._record_event(
+                "lm_inference_start",
+                model=model_name,
+                prompt_tokens=prompt_tokens,
+            )
+            try:
+                response = original_call(*args, **kwargs)
+            except Exception as exc:
+                self._record_event(
+                    "lm_inference_end",
+                    model=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=0,
+                    error=str(exc),
+                )
+                raise
+            completion_tokens = _estimate_tokens(_llm, response)
+            self._record_event(
+                "lm_inference_end",
+                model=model_name,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+            return response
+
+        llm.call = types.MethodType(_instrumented_call, llm)
+        setattr(llm, "_ipw_terminus_instrumented", True)
+        return True
 
     def _get_docker_client(self):
         """Get or create the Docker client."""
@@ -141,6 +196,26 @@ class Terminus(BaseAgent):
             disable_recording=True,
         )
 
+    def _instrument_session_tools(self, session: Any) -> Any:
+        """Record terminal commands as tool calls on the provided session."""
+        if getattr(session, "_ipw_tool_instrumented", False) is True:
+            return session
+
+        original_send_keys = session.send_keys
+
+        def _send_keys_with_events(*args: Any, **kwargs: Any) -> Any:
+            command = args[0] if args else kwargs.get("keys", "")
+            command_text = str(command)
+            self._record_event("tool_call_start", tool="terminal", command=command_text)
+            try:
+                return original_send_keys(*args, **kwargs)
+            finally:
+                self._record_event("tool_call_end", tool="terminal", command=command_text)
+
+        session.send_keys = _send_keys_with_events
+        setattr(session, "_ipw_tool_instrumented", True)
+        return session
+
     def run(
         self,
         input: str,
@@ -157,17 +232,21 @@ class Terminus(BaseAgent):
         Returns:
             AgentRunResult with the terminal output.
         """
-        self._record_event("lm_inference_start", model=str(self.agent))
+        if not self._records_lm_calls:
+            self._record_event("lm_inference_start", model=str(self.agent))
         try:
-            session = self.get_session(tmux_session)
-            self.agent.perform_task(input, session=session, **kwargs)
+            session = self._instrument_session_tools(self.get_session(tmux_session))
+            agent_result = self.agent.perform_task(input, session=session, **kwargs)
 
             terminal_output = session.capture_pane(capture_entire=True)
             return AgentRunResult(
                 content=terminal_output,
+                input_tokens=getattr(agent_result, "total_input_tokens", 0),
+                output_tokens=getattr(agent_result, "total_output_tokens", 0),
             )
         finally:
-            self._record_event("lm_inference_end", model=str(self.agent))
+            if not self._records_lm_calls:
+                self._record_event("lm_inference_end", model=str(self.agent))
 
     def cleanup(self) -> None:
         """Clean up Docker resources."""

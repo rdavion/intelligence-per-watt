@@ -15,7 +15,7 @@ from ipw.execution.agentic_runner import (
 )
 from ipw.execution.telemetry_session import TelemetrySample
 from ipw.execution.trace import QueryTrace
-from ipw.telemetry.events import EventRecorder
+from ipw.telemetry.events import AgentEvent, EventRecorder, EventType
 
 
 class TestAgenticRunner:
@@ -117,10 +117,35 @@ class TestAgenticRunner:
         traces = asyncio.run(runner.run(max_queries=3))
         assert len(traces) == 3
 
+    def test_sequential_run_prunes_consumed_telemetry_samples(self) -> None:
+        agent = MagicMock()
+        agent.run.return_value = AgentRunResult(content="ok")
+        dataset = MagicMock()
+        records = [
+            DatasetRecord(
+                problem="Q", answer="A", subject="s",
+                dataset_metadata={"dataset_name": "test"},
+            )
+        ]
+        dataset.__iter__ = MagicMock(return_value=iter(records))
+        dataset.size.return_value = 1
+        dataset.create_task_env.return_value = None
+        telemetry = MagicMock()
+        telemetry.readings.return_value = []
+        telemetry.window.return_value = []
+
+        runner = AgenticRunner(
+            agent=agent,
+            dataset=dataset,
+            telemetry_session=telemetry,
+            config={"model": "test-model"},
+        )
+        asyncio.run(runner.run())
+
+        telemetry.prune_before.assert_called_once()
+
     def test_multi_turn_trace_building(self) -> None:
         """Verify _build_turn_traces correctly parses events into turns."""
-        from ipw.telemetry.events import AgentEvent, EventType
-
         runner = self._make_runner()
         now = 1000.0
 
@@ -160,6 +185,51 @@ class TestAgenticRunner:
         assert turns[0].output_tokens == 20
         assert turns[1].input_tokens == 30
         assert turns[1].output_tokens == 10
+
+    def test_tool_after_lm_end_extends_turn_telemetry_window(self) -> None:
+        """Tool calls produced by an LM response are attributed to that turn."""
+        runner = self._make_runner()
+        now = 1000.0
+        events = [
+            AgentEvent(event_type=EventType.LM_INFERENCE_START, timestamp=now),
+            AgentEvent(
+                event_type=EventType.LM_INFERENCE_END,
+                timestamp=now + 1.0,
+                metadata={"prompt_tokens": 50, "completion_tokens": 20},
+            ),
+            AgentEvent(
+                event_type=EventType.TOOL_CALL_START,
+                timestamp=now + 1.2,
+                metadata={"tool": "bash"},
+            ),
+            AgentEvent(
+                event_type=EventType.TOOL_CALL_END,
+                timestamp=now + 2.0,
+                metadata={"tool": "bash"},
+            ),
+        ]
+        readings = [
+            TelemetrySample(
+                timestamp=now,
+                reading=TelemetryReading(energy_joules=10.0, power_watts=100.0),
+            ),
+            TelemetrySample(
+                timestamp=now + 1.0,
+                reading=TelemetryReading(energy_joules=20.0, power_watts=100.0),
+            ),
+            TelemetrySample(
+                timestamp=now + 2.0,
+                reading=TelemetryReading(energy_joules=40.0, power_watts=100.0),
+            ),
+        ]
+
+        turns = runner._build_turn_traces(events, readings=readings)
+
+        assert len(turns) == 1
+        assert turns[0].tools_called == ["bash"]
+        assert turns[0].tool_latencies_s["bash"] == pytest.approx(0.8)
+        assert turns[0].wall_clock_s == pytest.approx(2.0)
+        assert turns[0].gpu_energy_joules == pytest.approx(30.0)
 
     def test_event_recorder_integration_with_runner(self) -> None:
         """Verify events recorded during agent.run() flow into traces.

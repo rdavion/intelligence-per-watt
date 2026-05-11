@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import deque
@@ -26,8 +27,8 @@ class TelemetrySession(AbstractContextManager["TelemetrySession"]):
         self,
         collector: EnergyMonitorCollector,
         *,
-        buffer_seconds: float = 30.0,
-        max_samples: int = 10_000,
+        buffer_seconds: Optional[float] = None,
+        max_samples: Optional[int] = None,
     ) -> None:
         self._collector = collector
         self._buffer_seconds = buffer_seconds
@@ -36,6 +37,7 @@ class TelemetrySession(AbstractContextManager["TelemetrySession"]):
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._collector_ctx = None
+        self._gpu_device_id = self._resolve_gpu_device_id()
 
     def __enter__(self) -> "TelemetrySession":
         self._collector_ctx = self._collector.start()
@@ -55,6 +57,8 @@ class TelemetrySession(AbstractContextManager["TelemetrySession"]):
     def _run(self) -> None:
         try:
             for reading in self._collector.stream_readings():
+                if not self._include_reading(reading):
+                    continue
                 timestamp = (
                     float(reading.timestamp_nanos) / 1_000_000_000.0
                     if reading.timestamp_nanos is not None
@@ -70,10 +74,31 @@ class TelemetrySession(AbstractContextManager["TelemetrySession"]):
             self._stop_event.set()
             raise
 
-    def _trim(self, current_time: float) -> None:
-        cutoff = current_time - self._buffer_seconds
-        while self._samples and self._samples[0].timestamp < cutoff:
+    def _resolve_gpu_device_id(self) -> Optional[int]:
+        device = os.getenv("IPW_GPU_DEVICE_ID")
+        if device is None:
+            visible = [part.strip() for part in os.getenv("CUDA_VISIBLE_DEVICES", "").split(",") if part.strip()]
+            device = visible[0] if len(visible) == 1 else None
+        try:
+            return int(device) if device is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _include_reading(self, reading: TelemetryReading) -> bool:
+        gpu_info = reading.gpu_info
+        return self._gpu_device_id is None or gpu_info is None or int(gpu_info.device_id) == self._gpu_device_id
+
+    def _drop_before(self, timestamp: float) -> None:
+        while self._samples and self._samples[0].timestamp < timestamp:
             self._samples.popleft()
+
+    def _trim(self, current_time: float) -> None:
+        if self._buffer_seconds is not None:
+            self._drop_before(current_time - self._buffer_seconds)
+
+    def prune_before(self, timestamp: float) -> None:
+        """Discard samples older than ``timestamp`` after they are consumed."""
+        self._drop_before(timestamp)
 
     def readings(self) -> Iterable[TelemetrySample]:
         return list(self._samples)

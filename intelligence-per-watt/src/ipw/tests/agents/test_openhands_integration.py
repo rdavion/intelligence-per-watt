@@ -134,6 +134,7 @@ class TestOpenHandsIntegration:
 
         _mock_openhands["get_agent_final_response"].return_value = "done"
         conv_mock = MagicMock()
+        conv_mock.run.side_effect = lambda: model.call("test")
         _mock_openhands["LocalConversation"].return_value = conv_mock
 
         recorder = EventRecorder()
@@ -145,6 +146,24 @@ class TestOpenHandsIntegration:
         event_types = [e.event_type for e in events]
         assert EventType.LM_INFERENCE_START in event_types
         assert EventType.LM_INFERENCE_END in event_types
+
+    def test_shared_model_uses_current_agent_recorder(self, _mock_openhands: dict) -> None:
+        from ipw.agents.openhands import OpenHands
+
+        _mock_openhands["get_agent_final_response"].return_value = "done"
+        model = MagicMock()
+        conversations = [MagicMock(), MagicMock()]
+        for label, conversation in zip(("one", "two"), conversations):
+            conversation.run.side_effect = lambda label=label: model.call(label)
+        _mock_openhands["LocalConversation"].side_effect = conversations
+
+        recorders = [EventRecorder(), EventRecorder()]
+        for label, recorder in zip(("one", "two"), recorders):
+            OpenHands(model=model, event_recorder=recorder).run(label)
+
+        expected = [EventType.LM_INFERENCE_START, EventType.LM_INFERENCE_END]
+        for recorder in recorders:
+            assert [event.event_type for event in recorder.get_events()] == expected
 
     def test_conversation_closed_after_run(self, _mock_openhands: dict) -> None:
         from ipw.agents.openhands import OpenHands

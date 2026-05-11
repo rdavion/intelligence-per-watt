@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextvars
+import inspect
 import json
 import logging
 import os
@@ -20,6 +22,87 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _docker_host_ip: str | None = None
+_ACTIVE_OPENHANDS_RECORDER = contextvars.ContextVar("ipw_openhands_event_recorder", default=None)
+
+
+def _usage_counts(model: Any) -> tuple[int, int, float]:
+    """Return accumulated prompt/output tokens and cost from an OpenHands LLM."""
+    input_tokens = 0
+    output_tokens = 0
+    cost_usd = 0.0
+    try:
+        metrics = model.metrics
+        if metrics.accumulated_token_usage is not None:
+            prompt_tokens = metrics.accumulated_token_usage.prompt_tokens
+            completion_tokens = metrics.accumulated_token_usage.completion_tokens
+            if isinstance(prompt_tokens, (int, float)):
+                input_tokens = int(prompt_tokens)
+            if isinstance(completion_tokens, (int, float)):
+                output_tokens = int(completion_tokens)
+        accumulated_cost = metrics.accumulated_cost
+        if isinstance(accumulated_cost, (int, float)):
+            cost_usd = float(accumulated_cost)
+    except Exception:
+        pass
+    return input_tokens, output_tokens, cost_usd
+
+
+_CALL_METHODS = ("call", "chat", "completion", "acompletion", "complete", "acomplete", "invoke", "ainvoke")
+
+
+def _record_active_event(event_type: str, **metadata: Any) -> None:
+    recorder = _ACTIVE_OPENHANDS_RECORDER.get()
+    if recorder is not None:
+        recorder.record(event_type, **metadata)
+
+
+def _instrument_openhands_llm(model: Any) -> Any:
+    """Record every OpenHands LLM call while preserving the LLM instance type."""
+    if getattr(model, "_ipw_instrumented", False) is True:
+        return model
+
+    def _record_lm_end(pre_input: int, pre_output: int, pre_cost: float) -> None:
+        post_input, post_output, post_cost = _usage_counts(model)
+        metadata: dict[str, Any] = {"model": str(model)}
+        for key, value in (
+            ("prompt_tokens", post_input - pre_input),
+            ("completion_tokens", post_output - pre_output),
+        ):
+            if value > 0:
+                metadata[key] = value
+        if cost_delta := post_cost - pre_cost:
+            metadata["cost_usd"] = cost_delta
+        _record_active_event("lm_inference_end", **metadata)
+
+    def _wrap_call(func: Any) -> Any:
+        if inspect.iscoroutinefunction(func):
+            async def _async_wrapped(*args: Any, **kwargs: Any) -> Any:
+                pre_input, pre_output, pre_cost = _usage_counts(model)
+                _record_active_event("lm_inference_start", model=str(model))
+                try:
+                    return await func(*args, **kwargs)
+                finally:
+                    _record_lm_end(pre_input, pre_output, pre_cost)
+
+            return _async_wrapped
+
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            pre_input, pre_output, pre_cost = _usage_counts(model)
+            _record_active_event("lm_inference_start", model=str(model))
+            try:
+                return func(*args, **kwargs)
+            finally:
+                _record_lm_end(pre_input, pre_output, pre_cost)
+
+        return _wrapped
+
+    for name in _CALL_METHODS:
+        attr = getattr(model, name, None)
+        if callable(attr):
+            object.__setattr__(model, name, _wrap_call(attr))
+
+    object.__setattr__(model, "_ipw_instrumented", True)
+    return model
 
 
 def _get_docker_host_ip() -> str:
@@ -372,6 +455,7 @@ class OpenHands(BaseAgent):
             )
 
         self.model = model
+        self._instrumented_model = _instrument_openhands_llm(model)
         self.tools = tools
         self._pending_tool: Optional[str] = None
         self._tool_names_used: List[str] = []
@@ -390,12 +474,12 @@ class OpenHands(BaseAgent):
 
         # Context condenser
         condenser = LLMSummarizingCondenser(
-            llm=model,
+            llm=self._instrumented_model,
             max_tokens=24000,
             keep_first=2,
         )
 
-        agent_kwargs = {"llm": model, "condenser": condenser}
+        agent_kwargs = {"llm": self._instrumented_model, "condenser": condenser}
 
         if tools:
             agent_kwargs["tools"] = tools
@@ -493,19 +577,9 @@ class OpenHands(BaseAgent):
         self.conversation = self._create_conversation()
 
         # Snapshot LLM token metrics before this run to compute per-query delta
-        _pre_input = 0
-        _pre_output = 0
-        _pre_cost = 0.0
-        try:
-            _m = self.model.metrics
-            if _m.accumulated_token_usage is not None:
-                _pre_input = _m.accumulated_token_usage.prompt_tokens or 0
-                _pre_output = _m.accumulated_token_usage.completion_tokens or 0
-            _pre_cost = _m.accumulated_cost or 0.0
-        except Exception:
-            pass
+        _pre_input, _pre_output, _pre_cost = _usage_counts(self.model)
 
-        self._record_event("lm_inference_start", model=str(self.model))
+        recorder_token = _ACTIVE_OPENHANDS_RECORDER.set(self.event_recorder)
         try:
             self.conversation.send_message(input)
             self.conversation.run()
@@ -532,17 +606,10 @@ class OpenHands(BaseAgent):
             self.current_result = ""
 
             # Extract per-query token usage as delta from pre-run snapshot
-            input_tokens = 0
-            output_tokens = 0
-            cost_usd = 0.0
-            try:
-                metrics = self.model.metrics
-                if metrics.accumulated_token_usage is not None:
-                    input_tokens = (metrics.accumulated_token_usage.prompt_tokens or 0) - _pre_input
-                    output_tokens = (metrics.accumulated_token_usage.completion_tokens or 0) - _pre_output
-                cost_usd = (metrics.accumulated_cost or 0.0) - _pre_cost
-            except Exception:
-                pass
+            post_input, post_output, post_cost = _usage_counts(self.model)
+            input_tokens = post_input - _pre_input
+            output_tokens = post_output - _pre_output
+            cost_usd = post_cost - _pre_cost
 
             return AgentRunResult(
                 content=result,
@@ -555,7 +622,7 @@ class OpenHands(BaseAgent):
                 cost_usd=cost_usd,
             )
         finally:
-            self._record_event("lm_inference_end", model=str(self.model))
+            _ACTIVE_OPENHANDS_RECORDER.reset(recorder_token)
             try:
                 self.conversation.close()
             except Exception as e:

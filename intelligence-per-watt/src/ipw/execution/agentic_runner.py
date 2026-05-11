@@ -432,6 +432,7 @@ class AgenticRunner:
                 completed=False,
                 is_resolved=record.dataset_metadata.get("is_resolved"),
             )
+            self._prune_telemetry_before(end_time)
             return trace
 
         end_time = time.time()
@@ -516,131 +517,123 @@ class AgenticRunner:
         # Correlate energy data with trace
         trace = self._correlate_energy(trace, readings)
 
+        self._prune_telemetry_before(end_time)
+
         return trace
+
+    def _prune_telemetry_before(self, timestamp: float) -> None:
+        if self._telemetry and self._concurrency <= 1:
+            self._telemetry.prune_before(timestamp)
 
     def _build_turn_traces(
         self,
         events: list,
         readings: list[TelemetrySample],
     ) -> list[TurnTrace]:
-        """Build TurnTrace objects from recorded events."""
-        turns: list[TurnTrace] = []
-        current_turn_index = 0
-        current_turn_start: Optional[float] = None
-        current_tools: list[str] = []
-        current_tool_latencies: dict[str, float] = {}
-        tool_start_times: dict[str, float] = {}
-        input_tokens = 0
-        output_tokens = 0
+        """Build turns, attaching post-LM tool events to the preceding LLM call."""
+        turn_records: list[dict[str, Any]] = []
+        current_turn: Optional[dict[str, Any]] = None
+        tool_start_times: dict[str, list[tuple[float, Optional[dict[str, Any]]]]] = {}
+
+        def _new_turn(start_ts: float) -> dict[str, Any]:
+            return {
+                "start": start_ts, "end": start_ts,
+                "input_tokens": 0, "output_tokens": 0, "cost_usd": None,
+                "tools_called": [], "tool_latencies_s": {},
+            }
+
+        def _latency_key(latencies: dict[str, float], tool_name: str) -> str:
+            if tool_name not in latencies:
+                return tool_name
+            suffix = 2
+            while f"{tool_name}#{suffix}" in latencies:
+                suffix += 1
+            return f"{tool_name}#{suffix}"
+
+        def _attach_tool(
+            record: Optional[dict[str, Any]],
+            tool_name: str,
+            latency: Optional[float],
+            end_ts: float,
+        ) -> None:
+            if record is None:
+                record = current_turn or (turn_records[-1] if turn_records else None)
+            if record is None:
+                record = _new_turn(end_ts)
+                turn_records.append(record)
+            record["tools_called"].append(tool_name)
+            if latency is not None:
+                record["tool_latencies_s"][
+                    _latency_key(record["tool_latencies_s"], tool_name)
+                ] = latency
+            record["end"] = max(record["end"], end_ts)
 
         for event in events:
             etype = event.event_type
 
             if etype == EventType.LM_INFERENCE_START:
-                current_turn_start = event.timestamp
+                current_turn = _new_turn(event.timestamp)
 
             elif etype == EventType.LM_INFERENCE_END:
-                wall_clock = 0.0
-                if current_turn_start is not None:
-                    wall_clock = event.timestamp - current_turn_start
+                if current_turn is None:
+                    current_turn = _new_turn(event.timestamp)
+                current_turn["end"] = max(current_turn["end"], event.timestamp)
+                current_turn["input_tokens"] = event.metadata.get("prompt_tokens", 0)
+                current_turn["output_tokens"] = event.metadata.get("completion_tokens", 0)
+                if "cost_usd" in event.metadata:
+                    current_turn["cost_usd"] = event.metadata["cost_usd"]
+                turn_records.append(current_turn)
+                current_turn = None
 
-                input_tokens = event.metadata.get("prompt_tokens", 0)
-                output_tokens = event.metadata.get("completion_tokens", 0)
+            elif etype == EventType.TOOL_CALL_START:
+                tool_name = event.metadata.get("tool", "unknown")
+                owner = current_turn or (turn_records[-1] if turn_records else None)
+                tool_start_times.setdefault(tool_name, []).append((event.timestamp, owner))
 
-                # Get energy readings for this turn window
-                turn_gpu_energy = None
-                turn_cpu_energy = None
-                turn_gpu_power_avg = None
-                turn_cpu_power_avg = None
+            elif etype == EventType.TOOL_CALL_END:
+                tool_name = event.metadata.get("tool", "unknown")
+                starts = tool_start_times.get(tool_name, [])
+                start_ts = None
+                owner = None
+                if starts:
+                    start_ts, owner = starts.pop()
+                    if not starts:
+                        tool_start_times.pop(tool_name, None)
+                latency = event.timestamp - start_ts if start_ts is not None else None
+                _attach_tool(owner, tool_name, latency, event.timestamp)
 
-                if current_turn_start is not None and readings:
-                    turn_readings = [
-                        s for s in readings
-                        if current_turn_start <= s.timestamp <= event.timestamp
-                    ]
-                    if turn_readings:
-                        gpu_energies = [
-                            s.reading.energy_joules for s in turn_readings
-                            if s.reading.energy_joules is not None
-                            and math.isfinite(s.reading.energy_joules)
-                        ]
-                        if len(gpu_energies) >= 2:
-                            delta = gpu_energies[-1] - gpu_energies[0]
-                            turn_gpu_energy = delta if delta >= 0 else None
+        if current_turn is not None:
+            turn_records.append(current_turn)
 
-                        cpu_energies = [
-                            s.reading.cpu_energy_joules for s in turn_readings
-                            if s.reading.cpu_energy_joules is not None
-                            and math.isfinite(s.reading.cpu_energy_joules)
-                        ]
-                        if len(cpu_energies) >= 2:
-                            delta = cpu_energies[-1] - cpu_energies[0]
-                            turn_cpu_energy = delta if delta >= 0 else None
+        turns: list[TurnTrace] = []
+        for turn_index, record in enumerate(turn_records):
+            start = record["start"]
+            end = record["end"]
+            wall_clock = max(0.0, end - start)
+            turn_readings = [s for s in readings if start <= s.timestamp <= end]
+            turn_gpu_energy = _compute_energy_delta(turn_readings, "energy_joules")
+            turn_cpu_energy = _compute_energy_delta(turn_readings, "cpu_energy_joules")
+            turn_gpu_power_avg = _compute_power_avg(turn_readings, "power_watts")
+            turn_cpu_power_avg = _compute_power_avg(turn_readings, "cpu_power_watts")
 
-                        gpu_powers = [
-                            s.reading.power_watts for s in turn_readings
-                            if s.reading.power_watts is not None
-                            and math.isfinite(s.reading.power_watts)
-                        ]
-                        if gpu_powers:
-                            turn_gpu_power_avg = statistics.mean(gpu_powers)
+            if turn_gpu_energy is None and turn_readings:
+                turn_gpu_energy = _estimate_energy_from_power(turn_readings, "power_watts", wall_clock)
+            if turn_cpu_energy is None and turn_readings:
+                turn_cpu_energy = _estimate_energy_from_power(turn_readings, "cpu_power_watts", wall_clock)
 
-                        cpu_powers = [
-                            s.reading.cpu_power_watts for s in turn_readings
-                            if s.reading.cpu_power_watts is not None
-                            and math.isfinite(s.reading.cpu_power_watts)
-                        ]
-                        if cpu_powers:
-                            turn_cpu_power_avg = statistics.mean(cpu_powers)
-
-                    # Fallback: estimate energy from power when < 2 cumulative samples
-                    if turn_gpu_energy is None and turn_gpu_power_avg is not None and wall_clock > 0:
-                        turn_gpu_energy = turn_gpu_power_avg * wall_clock
-                    if turn_cpu_energy is None and turn_cpu_power_avg is not None and wall_clock > 0:
-                        turn_cpu_energy = turn_cpu_power_avg * wall_clock
-
-                turn = TurnTrace(
-                    turn_index=current_turn_index,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    tools_called=list(current_tools),
-                    tool_latencies_s=dict(current_tool_latencies),
+            turns.append(
+                TurnTrace(
+                    turn_index=turn_index,
+                    input_tokens=record["input_tokens"],
+                    output_tokens=record["output_tokens"],
+                    tools_called=list(record["tools_called"]),
+                    tool_latencies_s=dict(record["tool_latencies_s"]),
                     wall_clock_s=wall_clock,
                     gpu_energy_joules=turn_gpu_energy,
                     cpu_energy_joules=turn_cpu_energy,
                     gpu_power_avg_watts=turn_gpu_power_avg,
                     cpu_power_avg_watts=turn_cpu_power_avg,
-                )
-                turns.append(turn)
-
-                # Reset for next turn
-                current_turn_index += 1
-                current_turn_start = None
-                current_tools = []
-                current_tool_latencies = {}
-                input_tokens = 0
-                output_tokens = 0
-
-            elif etype == EventType.TOOL_CALL_START:
-                tool_name = event.metadata.get("tool", "unknown")
-                tool_start_times[tool_name] = event.timestamp
-
-            elif etype == EventType.TOOL_CALL_END:
-                tool_name = event.metadata.get("tool", "unknown")
-                current_tools.append(tool_name)
-                start_ts = tool_start_times.pop(tool_name, None)
-                if start_ts is not None:
-                    current_tool_latencies[tool_name] = (
-                        event.timestamp - start_ts
-                    )
-
-        # If there were events but no complete turn, create a synthetic one
-        if not turns and events:
-            turns.append(
-                TurnTrace(
-                    turn_index=0,
-                    tools_called=current_tools,
-                    tool_latencies_s=current_tool_latencies,
+                    cost_usd=record.get("cost_usd"),
                 )
             )
 

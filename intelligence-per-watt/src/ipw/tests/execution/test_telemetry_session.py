@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from unittest.mock import Mock
 
-from ipw.core.types import TelemetryReading
+from ipw.core.types import GpuInfo, TelemetryReading
 from ipw.execution.telemetry_session import TelemetrySample, TelemetrySession
 
 
@@ -136,6 +136,45 @@ class TestTelemetrySession:
         # That means only the sample at 10.0 should remain
         assert len(session._samples) == 1
         assert session._samples[0].timestamp == 10.0
+
+    def test_default_trim_keeps_samples(self) -> None:
+        collector = Mock()
+        session = TelemetrySession(collector)
+
+        session._samples.append(
+            TelemetrySample(timestamp=1.0, reading=TelemetryReading())
+        )
+        session._samples.append(
+            TelemetrySample(timestamp=10.0, reading=TelemetryReading())
+        )
+
+        session._trim(10.0)
+
+        assert len(session._samples) == 2
+
+    def test_prune_before_discards_consumed_samples(self) -> None:
+        collector = Mock()
+        session = TelemetrySession(collector)
+
+        for timestamp in (1.0, 2.0, 3.0):
+            session._samples.append(
+                TelemetrySample(timestamp=timestamp, reading=TelemetryReading())
+            )
+
+        session.prune_before(2.5)
+
+        assert [sample.timestamp for sample in session._samples] == [3.0]
+
+    def test_filters_to_explicit_gpu_device(self, monkeypatch) -> None:
+        collector = Mock()
+        monkeypatch.setenv("IPW_GPU_DEVICE_ID", "2")
+        session = TelemetrySession(collector)
+
+        matching = TelemetryReading(gpu_info=GpuInfo(device_id=2))
+        other = TelemetryReading(gpu_info=GpuInfo(device_id=3))
+
+        assert session._include_reading(matching) is True
+        assert session._include_reading(other) is False
 
     def test_respects_max_samples(self) -> None:
         collector = Mock()
